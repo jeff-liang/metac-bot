@@ -205,8 +205,8 @@ class CriticChallengerBot2025(ForecastBot):
                 current_prediction = new_prediction
 
             # Add to dialogue history
-            dialogue_history.append(f"Round {round_num + 1} Critic: {critic_response}...")
-            dialogue_history.append(f"Round {round_num + 1} Forecaster: {forecaster_response}...")
+            dialogue_history.append(f"Round {round_num + 1} Critic: {critic_response}")
+            dialogue_history.append(f"Round {round_num + 1} Forecaster: {forecaster_response}")
 
         logger.info(f"Max dialogue rounds reached. Final prediction: {current_prediction}")
         return current_reasoning, current_prediction
