@@ -45,7 +45,7 @@ class CriticChallengerBot2025(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
     # Critic-challenger parameters
-    _max_dialogue_rounds = 5  # Maximum back-and-forth rounds
+    _max_dialogue_rounds = 7  # Maximum back-and-forth rounds
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         """Run research phase - unchanged from original"""
@@ -536,7 +536,7 @@ if __name__ == "__main__":
 
     critic_bot = CriticChallengerBot2025(
         research_reports_per_question=1,
-        predictions_per_research_report=1,
+        predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
