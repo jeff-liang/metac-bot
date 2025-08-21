@@ -2,7 +2,7 @@ import argparse
 import asyncio
 import logging
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Tuple, Optional
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -26,87 +26,29 @@ from forecasting_tools import (
 logger = logging.getLogger(__name__)
 
 
-class FallTemplateBot2025(ForecastBot):
+class CriticChallengerBot2025(ForecastBot):
     """
-    This is a copy of the template bot for Fall 2025 Metaculus AI Tournament.
-    This bot is what is used by Metaculus in our benchmark, but is also provided as a template for new bot makers.
-    This template is given as-is, and though we have covered most test cases
-    in forecasting-tools it may be worth double checking key components locally.
+    Enhanced forecasting bot with a critic-challenger system.
 
-    Main changes since Q2:
-    - An LLM now parses the final forecast output (rather than programmatic parsing)
-    - Added resolution criteria and fine print explicitly to the research prompt
-    - Previously in the prompt, nothing about upper/lower bound was shown when the bounds were open. Now a suggestion is made when this is the case.
-    - Support for nominal bounds was added (i.e. when there are discrete questions and normal upper/lower bounds are not as intuitive)
+    After the main forecaster makes an initial prediction, a critic LLM with higher temperature
+    challenges the reasoning and prediction. They engage in a back-and-forth dialogue until
+    they reach agreement or hit the maximum number of rounds.
 
-    The main entry point of this bot is `forecast_on_tournament` in the parent class.
-    See the script at the bottom of the file for more details on how to run the bot.
-    Ignoring the finer details, the general flow is:
-    - Load questions from Metaculus
-    - For each question
-        - Execute run_research a number of times equal to research_reports_per_question
-        - Execute respective run_forecast function `predictions_per_research_report * research_reports_per_question` times
-        - Aggregate the predictions
-        - Submit prediction (if publish_reports_to_metaculus is True)
-    - Return a list of ForecastReport objects
-
-    Only the research and forecast functions need to be implemented in ForecastBot subclasses,
-    though you may want to override other ones.
-    In this example, you can change the prompts to be whatever you want since,
-    structure_output uses an LLMto intelligently reformat the output into the needed structure.
-
-    By default (i.e. 'tournament' mode), when you run this script, it will forecast on any open questions for the
-    MiniBench and Seasonal AIB tournaments. If you want to forecast on only one or the other, you can remove one
-    of them from the 'tournament' mode code at the bottom of the file.
-
-    You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-3-5-sonnet-20241022", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/deep-research/low",
-            "parser": "openai/gpt-4o-mini",
-        },
-    )
-    ```
-
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name"
-    if research_strategy == "asknews/deep-research/low":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "model_name").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
-
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
+    This adversarial approach helps:
+    - Identify blind spots in reasoning
+    - Challenge overconfident predictions
+    - Consider alternative scenarios
+    - Reach more robust consensus predictions
     """
 
-    _max_concurrent_questions = (
-        2  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
+    _max_concurrent_questions = 2
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
+    # Critic-challenger parameters
+    _max_dialogue_rounds = 5  # Maximum back-and-forth rounds
+
     async def run_research(self, question: MetaculusQuestion) -> str:
+        """Run research phase - unchanged from original"""
         async with self._concurrency_limiter:
             research = ""
             researcher = self.get_llm("researcher")
@@ -165,10 +107,115 @@ class FallTemplateBot2025(ForecastBot):
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
+    async def _critic_challenger_dialogue(
+            self,
+            question_text: str,
+            research: str,
+            initial_reasoning: str,
+            initial_prediction: str,
+            question_type_instr: str,
+            additional_context: str = ""
+    ) -> Tuple[str, str]:
+        """
+        Facilitate a dialogue between the forecaster and critic until convergence.
+
+        Returns:
+            Tuple of (final_reasoning, final_prediction)
+        """
+        dialogue_history = [f"Initial Forecaster Reasoning: {initial_reasoning}"]
+        current_reasoning = initial_reasoning
+        current_prediction = initial_prediction
+
+        for round_num in range(self._max_dialogue_rounds):
+            logger.info(f"Critic-Challenger Round {round_num + 1}/{self._max_dialogue_rounds}")
+
+            # Critic challenges the current prediction
+            critic_prompt = clean_indents(
+                f"""
+                You are a critical analyst reviewing a forecast. Your job is to challenge the reasoning and identify potential flaws.
+
+                Question: {question_text}
+
+                Research available: {research}
+
+                {additional_context}
+
+                {"Previous dialogue:" + chr(10).join(dialogue_history)}
+
+                Critically analyze this forecast by:
+                1. Identifying potential biases or blind spots in the reasoning
+                2. Suggesting alternative scenarios not fully considered
+                3. Questioning the confidence level - is it too high or too low?
+                4. Pointing out any logical inconsistencies
+                5. Suggesting what additional factors should be weighted differently
+
+                If you think the forecast is reasonable and well-justified, say "I AGREE with this forecast" and explain why.
+                Otherwise, provide your critique and suggest what the prediction should be instead.
+
+                End your response with either:
+                - "I AGREE - Final prediction: [prediction]" if you agree
+                - "I DISAGREE - Suggested prediction: [your prediction]" if you disagree
+                """
+            )
+
+            critic_response = await self.get_llm("critic", "llm").invoke(critic_prompt)
+            logger.info(f"Critic response: {critic_response[:500]}...")
+
+            # Check if critic agrees
+            if "I AGREE" in critic_response.upper():
+                logger.info("Critic agrees with forecaster - consensus reached")
+                final_reasoning = f"{current_reasoning}\n\nCritic's Agreement:\n{critic_response}"
+                return final_reasoning, current_prediction
+
+            # Forecaster responds to criticism
+            forecaster_response_prompt = clean_indents(
+                f"""
+                You are the original forecaster. A critic has challenged your prediction.
+
+                Question: {question_text}
+
+                Research: {research}
+
+                {additional_context}
+
+                {"Previous dialogue:" + chr(10).join(dialogue_history)}
+
+                Consider the critic's points carefully. You should:
+                1. Acknowledge valid criticisms
+                2. Defend aspects of your reasoning you still believe are correct
+                3. Adjust your prediction if the critic made compelling points
+                4. Provide updated reasoning incorporating the valuable insights
+
+                Provide your updated reasoning and end with:
+                "Updated prediction: [your final prediction for this round]"
+                where the prediction is formatted according to these rules:
+                {question_type_instr}
+                """
+            )
+
+            forecaster_response = await self.get_llm("default", "llm").invoke(forecaster_response_prompt)
+            logger.info(f"Forecaster response: {forecaster_response[:500]}...")
+
+            # Extract updated prediction from forecaster's response
+            if "Updated prediction:" in forecaster_response:
+                prediction_start = forecaster_response.rfind("Updated prediction:")
+                new_prediction = forecaster_response[prediction_start:].replace("Updated prediction:", "").strip()
+
+                current_reasoning = forecaster_response
+                current_prediction = new_prediction
+
+            # Add to dialogue history
+            dialogue_history.append(f"Round {round_num + 1} Critic: {critic_response}...")
+            dialogue_history.append(f"Round {round_num + 1} Forecaster: {forecaster_response}...")
+
+        logger.info(f"Max dialogue rounds reached. Final prediction: {current_prediction}")
+        return current_reasoning, current_prediction
+
     async def _run_forecast_on_binary(
-        self, question: BinaryQuestion, research: str
+            self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-        prompt = clean_indents(
+        # Initial forecast
+        initial_prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
 
@@ -178,12 +225,10 @@ class FallTemplateBot2025(ForecastBot):
             Question background:
             {question.background_info}
 
-
             This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
             {question.resolution_criteria}
 
             {question.fine_print}
-
 
             Your research assistant says:
             {research}
@@ -198,25 +243,48 @@ class FallTemplateBot2025(ForecastBot):
 
             You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
 
-            The last thing you write is your final answer as: "Probability: ZZ%", 0-100
+            The last thing you write is your final answer as: "Probability: ZZ.Z%", 0.1-99.9
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
-        )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
 
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {decimal_pred}"
+        initial_reasoning = await self.get_llm("default", "llm").invoke(initial_prompt)
+        logger.info(f"Initial reasoning for URL {question.page_url}: {initial_reasoning}")
+
+        # Extract initial prediction
+        initial_binary_prediction: BinaryPrediction = await structure_output(
+            initial_reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
         )
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        initial_pred_str = f"{initial_binary_prediction.prediction_in_decimal * 100:.0f}%"
+
+        # Run critic-challenger dialogue
+        additional_context = f"""
+        Background: {question.background_info}
+        Resolution criteria: {question.resolution_criteria}
+        Fine print: {question.fine_print}
+        """
+
+        final_reasoning, final_pred_str = await self._critic_challenger_dialogue(
+            question.question_text,
+            research,
+            initial_reasoning,
+            initial_pred_str,
+            "ZZ.Z%, 0.1-99.9",
+            additional_context
+        )
+
+        # Parse final prediction
+        final_binary_prediction: BinaryPrediction = await structure_output(
+            f"Probability: {final_pred_str}", BinaryPrediction, model=self.get_llm("parser", "llm")
+        )
+        decimal_pred = max(0.01, min(0.99, final_binary_prediction.prediction_in_decimal))
+
+        logger.info(f"Final forecasted URL {question.page_url} with prediction: {decimal_pred}")
+        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=final_reasoning)
 
     async def _run_forecast_on_multiple_choice(
-        self, question: MultipleChoiceQuestion, research: str
+            self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
-        prompt = clean_indents(
+        initial_prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
 
@@ -225,14 +293,12 @@ class FallTemplateBot2025(ForecastBot):
 
             The options are: {question.options}
 
-
             Background:
             {question.background_info}
 
             {question.resolution_criteria}
 
             {question.fine_print}
-
 
             Your research assistant says:
             {research}
@@ -253,6 +319,10 @@ class FallTemplateBot2025(ForecastBot):
             Option_N: Probability_N
             """
         )
+
+        initial_reasoning = await self.get_llm("default", "llm").invoke(initial_prompt)
+        logger.info(f"Initial reasoning for URL {question.page_url}: {initial_reasoning}")
+
         parsing_instructions = clean_indents(
             f"""
             Make sure that all option names are one of the following:
@@ -260,28 +330,60 @@ class FallTemplateBot2025(ForecastBot):
             The text you are parsing may prepend these options with some variation of "Option" which you should remove if not part of the option names I just gave you.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
+
+        initial_predicted_options: PredictedOptionList = await structure_output(
+            text_to_structure=initial_reasoning,
             output_type=PredictedOptionList,
             model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
         )
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}"
+
+        # Format initial prediction for dialogue
+        initial_pred_str = "\n".join(
+            [f"{opt.option_name}: {opt.probability}" for opt in initial_predicted_options.predicted_options])
+
+        # Run critic-challenger dialogue
+        additional_context = f"""
+        Options: {question.options}
+        Background: {question.background_info}
+        Resolution criteria: {question.resolution_criteria}
+        Fine print: {question.fine_print}
+        """
+
+        final_reasoning, final_pred_str = await self._critic_challenger_dialogue(
+            question.question_text,
+            research,
+            initial_reasoning,
+            initial_pred_str,
+            f"""your final probabilities for the N options in this order {question.options} as:
+            Option_A: Probability_A
+            Option_B: Probability_B
+            ...
+            Option_N: Probability_N""",
+            additional_context
         )
+
+        # Parse final prediction
+        final_predicted_options: PredictedOptionList = await structure_output(
+            text_to_structure=final_pred_str,
+            output_type=PredictedOptionList,
+            model=self.get_llm("parser", "llm"),
+            additional_instructions=parsing_instructions,
+        )
+
+        logger.info(f"Final forecasted URL {question.page_url} with prediction: {final_predicted_options}")
         return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
+            prediction_value=final_predicted_options, reasoning=final_reasoning
         )
 
     async def _run_forecast_on_numeric(
-        self, question: NumericQuestion, research: str
+            self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
         upper_bound_message, lower_bound_message = (
             self._create_upper_and_lower_bound_messages(question)
         )
-        prompt = clean_indents(
+
+        initial_prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
 
@@ -331,19 +433,52 @@ class FallTemplateBot2025(ForecastBot):
             "
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning, list[Percentile], model=self.get_llm("parser", "llm")
+
+        initial_reasoning = await self.get_llm("default", "llm").invoke(initial_prompt)
+        logger.info(f"Initial reasoning for URL {question.page_url}: {initial_reasoning}")
+
+        initial_percentile_list: list[Percentile] = await structure_output(
+            initial_reasoning, list[Percentile], model=self.get_llm("parser", "llm")
         )
-        prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}"
+
+        # Format initial prediction for dialogue
+        initial_pred_str = "\n".join([f"Percentile {p.percentile}: {p.value}" for p in initial_percentile_list])
+
+        # Run critic-challenger dialogue
+        additional_context = f"""
+        Background: {question.background_info}
+        Resolution criteria: {question.resolution_criteria}
+        Fine print: {question.fine_print}
+        Units: {question.unit_of_measure if question.unit_of_measure else "Not stated"}
+        {lower_bound_message}
+        {upper_bound_message}
+        """
+
+        final_reasoning, final_pred_str = await self._critic_challenger_dialogue(
+            question.question_text,
+            research,
+            initial_reasoning,
+            initial_pred_str,
+            """Percentile 10: XX
+            Percentile 20: XX
+            Percentile 40: XX
+            Percentile 60: XX
+            Percentile 80: XX
+            Percentile 90: XX""",
+            additional_context
         )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+        # Parse final prediction
+        final_percentile_list: list[Percentile] = await structure_output(
+            final_pred_str, list[Percentile], model=self.get_llm("parser", "llm")
+        )
+        prediction = NumericDistribution.from_question(final_percentile_list, question)
+
+        logger.info(f"Final forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}")
+        return ReasonedPrediction(prediction_value=prediction, reasoning=final_reasoning)
 
     def _create_upper_and_lower_bound_messages(
-        self, question: NumericQuestion
+            self, question: NumericQuestion
     ) -> tuple[str, str]:
         if question.nominal_upper_bound is not None:
             upper_bound_number = question.nominal_upper_bound
@@ -382,7 +517,7 @@ if __name__ == "__main__":
     litellm_logger.propagate = False
 
     parser = argparse.ArgumentParser(
-        description="Run the Q1TemplateBot forecasting system"
+        description="Run the CriticChallengerBot forecasting system with adversarial dialogue"
     )
     parser.add_argument(
         "--mode",
@@ -399,61 +534,61 @@ if __name__ == "__main__":
         "test_questions",
     ], "Invalid run mode"
 
-    template_bot = FallTemplateBot2025(
+    critic_bot = CriticChallengerBot2025(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=1,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        # llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o", # "anthropic/claude-3-5-sonnet-20241022", etc (see docs for litellm)
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/deep-research/low",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model="openrouter/google/gemini-2.5-pro",
+                temperature=0.3,
+                timeout=40,
+                allowed_tries=2,
+            ),
+            "critic": GeneralLlm(
+                model="openrouter/x-ai/grok-4",  # Same model but different temperature
+                temperature=0.8,  # Higher temperature for more creative challenges
+                timeout=40,
+                allowed_tries=2,
+            ),
+        },
     )
 
     if run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            critic_bot.forecast_on_tournament(
                 MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True
             )
         )
         minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            critic_bot.forecast_on_tournament(
                 MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
         )
         forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
-        # The Metaculus cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564 or AI_2027_TOURNAMENT_ID = "ai-2027"
-        # The Metaculus cup may not be initialized near the beginning of a season (i.e. January, May, September)
-        template_bot.skip_previously_forecasted_questions = False
+        critic_bot.skip_previously_forecasted_questions = False
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            critic_bot.forecast_on_tournament(
                 MetaculusApi.CURRENT_METACULUS_CUP_ID, return_exceptions=True
             )
         )
     elif run_mode == "test_questions":
-        # Example questions are a good way to test the bot's performance on a single question
         EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
-            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
+            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
+            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
         ]
-        template_bot.skip_previously_forecasted_questions = False
+        critic_bot.skip_previously_forecasted_questions = False
         questions = [
             MetaculusApi.get_question_by_url(question_url)
             for question_url in EXAMPLE_QUESTIONS
         ]
         forecast_reports = asyncio.run(
-            template_bot.forecast_questions(questions, return_exceptions=True)
+            critic_bot.forecast_questions(questions, return_exceptions=True)
         )
-    template_bot.log_report_summary(forecast_reports)
+    critic_bot.log_report_summary(forecast_reports)
