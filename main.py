@@ -554,6 +554,11 @@ if __name__ == "__main__":
                 timeout=40,
                 allowed_tries=2,
             ),
+            "researcher": GeneralLlm(
+                model="openrouter/perplexity/sonar-deep-research",
+                timeout=40,
+                allowed_tries=2,
+            ),
         },
     )
 
